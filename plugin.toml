@@ -1,0 +1,84 @@
+[plugin]
+name = "prowlarr-qbittorrent"
+display_name = "Torrents (Prowlarr / qBittorrent)"
+version = "0.1.0"
+api_version = 1
+entrypoint = "plugin:TorrentPlugin"
+capabilities = ["download_client", "indexer"]
+description = "Prowlarr or Torznab search with qBittorrent downloads and seeding-safe import copies."
+author = "alphyriver"
+
+[[capability]]
+id = "download_client"
+source = "prowlarr-qbittorrent"
+display_name = "Torrents"
+
+[[capability]]
+id = "indexer"
+target_source = "plugin:prowlarr-qbittorrent"
+
+[[settings]]
+key = "qbittorrent_url"
+label = "qBittorrent URL"
+help = "Web UI base URL; qBittorrent 5.2+ required."
+secret = false
+
+[[settings]]
+key = "qbittorrent_api_key"
+label = "qBittorrent API key"
+help = "Bearer API key."
+secret = true
+
+[[settings]]
+key = "downloads_path"
+label = "Torrent downloads mount"
+help = "Absolute path inside DroppedNeedle mapping the qBittorrent category save directory."
+secret = false
+
+[[settings]]
+key = "staging_path"
+label = "Import staging directory"
+help = "Dedicated absolute writable directory, separate from downloads and the music library. Copies use additional disk space."
+secret = false
+
+[[settings]]
+key = "category"
+label = "qBittorrent category"
+help = "Default: droppedneedle. Configure its save path in qBittorrent first."
+secret = false
+
+[[settings]]
+key = "search_backend"
+label = "Search backend"
+help = "prowlarr (default) or torznab. Exactly one backend is used."
+secret = false
+
+[[settings]]
+key = "prowlarr_url"
+label = "Prowlarr URL"
+help = "Base URL, including any reverse-proxy path."
+secret = false
+
+[[settings]]
+key = "prowlarr_api_key"
+label = "Prowlarr API key"
+help = "Required when search_backend is prowlarr."
+secret = true
+
+[[settings]]
+key = "torznab_url"
+label = "Torznab URL"
+help = "One direct Torznab feed URL; use Prowlarr to aggregate multiple indexers."
+secret = false
+
+[[settings]]
+key = "torznab_api_key"
+label = "Torznab API key"
+help = "Required when search_backend is torznab."
+secret = true
+
+[[settings]]
+key = "categories"
+label = "Audio category IDs"
+help = "Comma-separated category IDs. Default: 3000."
+secret = false

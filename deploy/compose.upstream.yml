@@ -1,0 +1,6 @@
+# Overlay for the existing Hercules musicseerr service; see ../MIGRATION.md.
+services:
+  musicseerr:
+    image: droppedneedle/droppedneedle:v2.15.0@sha256:6d58d829cc5aa29e5de95933ba1ce46f249ccf7ef3ed437c643231b771d711c5
+    volumes:
+      - /mnt/media/droppedneedle/plugin-staging:/plugin-staging:rw

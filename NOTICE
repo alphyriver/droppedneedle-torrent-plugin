@@ -1,0 +1,4 @@
+This plugin adapts qBittorrent and Prowlarr clients from
+https://github.com/alphyriver/DroppedNeedle at 51d8565d.
+DroppedNeedle contributors and alphyriver; AGPL-3.0-only.
+Plugin integration, durable staging, and tests added in September 2026.
