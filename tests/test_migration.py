@@ -1,7 +1,7 @@
 import json
 
-from cryptography.fernet import Fernet
 import pytest
+from cryptography.fernet import Fernet
 
 from prepare_migration import prepare
 
@@ -44,6 +44,7 @@ def test_candidate_preserves_secrets_and_source_config(tmp_path):
 
 def test_plugin_decrypts_legacy_ciphertext(tmp_path):
     from infrastructure import crypto
+
     import plugin
 
     old = crypto._fernet

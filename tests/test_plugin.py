@@ -19,21 +19,24 @@ class Wire:
         self.adds = 0
         self.deletes = []
         self.search_rows = [
-            dict(
-                title="Artist - Album FLAC",
-                protocol="torrent",
-                size=1000,
-                seeders=5,
-                infoHash="abc",
-                downloadUrl="/download/abc?apikey=secret",
-                categories=[{"id": 3040}],
-            )
+            {
+                "title": "Artist - Album FLAC",
+                "protocol": "torrent",
+                "size": 1000,
+                "seeders": 5,
+                "infoHash": "abc",
+                "downloadUrl": "/download/abc?apikey=secret",
+                "categories": [{"id": 3040}],
+            }
         ]
         self.xml = b"<rss><channel/></rss>"
         self.version = "v5.2.0"
+        self.qbt_down = False
 
     def __call__(self, req):
         if req.url.host == "qbt":
+            if self.qbt_down:
+                raise httpx.ConnectError("connection refused", request=req)
             assert req.headers["authorization"] == "Bearer qbt-key"
             if req.url.path.endswith("/app/version"):
                 return httpx.Response(200, text=self.version)
@@ -46,17 +49,17 @@ class Wire:
                 self.adds += 1
                 data = parse_qs(req.content.decode())
                 self.rows.append(
-                    dict(
-                        hash="abc",
-                        tags=data["tags"][0],
-                        category=data["category"][0],
-                        state="downloading",
-                        progress=0.4,
-                        size=1000,
-                        downloaded=400,
-                        save_path="/remote/music",
-                        content_path="/remote/music/Album",
-                    )
+                    {
+                        "hash": "abc",
+                        "tags": data["tags"][0],
+                        "category": data["category"][0],
+                        "state": "downloading",
+                        "progress": 0.4,
+                        "size": 1000,
+                        "downloaded": 400,
+                        "save_path": "/remote/music",
+                        "content_path": "/remote/music/Album",
+                    }
                 )
                 return httpx.Response(200, text="Ok.")
             if req.url.path.endswith("/torrents/delete"):
@@ -76,14 +79,14 @@ class Wire:
 
 @pytest.fixture
 async def setup(tmp_path):
-    settings = dict(
-        qbittorrent_url="http://qbt",
-        qbittorrent_api_key="qbt-key",
-        prowlarr_url="http://prowlarr",
-        prowlarr_api_key="prowlarr-key",
-        downloads_path=str(tmp_path / "downloads"),
-        staging_path=str(tmp_path / "staging"),
-    )
+    settings = {
+        "qbittorrent_url": "http://qbt",
+        "qbittorrent_api_key": "qbt-key",
+        "prowlarr_url": "http://prowlarr",
+        "prowlarr_api_key": "prowlarr-key",
+        "downloads_path": str(tmp_path / "downloads"),
+        "staging_path": str(tmp_path / "staging"),
+    }
     Path(settings["downloads_path"]).mkdir()
     wire = Wire()
     async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as http:
@@ -149,8 +152,9 @@ async def test_wire_lifecycle_restart_and_seeding(setup, tmp_path):
     assert len(staged) == 2
     assert all(str(path).startswith(settings["staging_path"]) for path in staged)
     evidence = await client.inspect_materialization(handle)
-    assert all(str(path).startswith(settings["staging_path"]) for path in evidence.file_paths)
-    assert not set(map(str, originals)) & set(evidence.file_paths)
+    # The host journal cannot unlink unfingerprinted plugin paths; report none.
+    assert evidence.file_paths == []
+    assert evidence.workspace_path.startswith(str(Path(settings["staging_path"]).resolve()))
     # Model the upstream importer's move + retag operations.
     library = tmp_path / "library"
     library.mkdir()
@@ -330,7 +334,7 @@ async def test_real_host_loads_disabled_then_activates_both_capabilities(
 
 @pytest.mark.parametrize("state", ["moving", "checkingUP", "checkingResumeData"])
 async def test_completed_torrent_not_imported_during_move_or_check(setup, state):
-    factory, wire, settings = setup
+    factory, wire, _settings = setup
     instance = factory()
     handle = await instance.enqueue(
         p.EnqueueRequest(
@@ -398,7 +402,7 @@ async def test_concurrent_enqueue_adds_once(setup):
 
 
 async def test_ambiguous_add_error_does_not_submit_fallback(setup, monkeypatch):
-    factory, wire, _ = setup
+    factory, _wire, _ = setup
     calls = []
 
     async def failed_add(self, **kwargs):
@@ -441,3 +445,163 @@ async def test_add_timeout_recovers_tagged_torrent(setup, monkeypatch):
     )
     assert (await instance.get_status(handle)).status == "downloading"
     assert wire.adds == 1
+
+
+class _NoBundles:
+    async def get_library_management_import_bundle(self, bundle_id):
+        return None
+
+    async def list_acquisition_import_bundles_for_download_task(self, task_id):
+        return []
+
+
+async def _journal(tmp_path, client, handle, task_id):
+    import sqlite3
+    import threading
+
+    from infrastructure.persistence.download_store import DownloadStore
+    from services.native.acquisition_cleanup_service import AcquisitionCleanupService
+
+    db = tmp_path / "library.db"
+    store = DownloadStore(db, threading.Lock())
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS auth_users (id TEXT PRIMARY KEY, username TEXT, role TEXT)"
+    )
+    connection.commit()
+    connection.close()
+    attempt = await store.create_download_attempt(
+        task_id=task_id,
+        source=p.SOURCE,
+        candidate_index=0,
+        job_name=handle.job_name,
+        handle=handle,
+        now=1.0,
+    )
+    await store.schedule_download_attempt_cleanup(
+        attempt.id, disposition="discard", publisher_bundle_ids=[], now=2.0
+    )
+    service = AcquisitionCleanupService(
+        store, _NoBundles(), lambda source: client, lambda: tmp_path, clock=lambda: 10.0
+    )
+    await service.run_once("worker")
+    return await store.get_download_attempt(attempt.id)
+
+
+async def test_real_cleanup_journal_completes_after_import(setup, tmp_path):
+    factory, wire, settings = setup
+    client = PluginClientAdapter("prowlarr-qbittorrent", factory())
+    task_id = "a" * 32
+    handle = await client.enqueue(
+        p.EnqueueRequest(
+            task_id=task_id,
+            source=p.SOURCE,
+            job_name=f"droppedneedle-{task_id}-0",
+            payload=json.dumps({"magnet_url": "magnet:?xt=urn:btih:abc"}),
+        )
+    )
+    original = Path(settings["downloads_path"]) / "Album" / "01.flac"
+    original.parent.mkdir()
+    original.write_bytes(b"torrent bytes")
+    wire.rows[0].update(progress=1.0, state="uploading")
+    library = tmp_path / "library"
+    library.mkdir()
+    for staged in await client.list_completed_files(handle):
+        shutil.move(staged, library / staged.name)
+    attempt = await _journal(tmp_path, client, handle, task_id)
+    assert (attempt.state, attempt.error_code) == ("complete", None)
+    assert not any(Path(settings["staging_path"]).iterdir())
+    assert wire.deletes == []
+    assert original.read_bytes() == b"torrent bytes"
+
+
+async def test_real_cleanup_journal_removes_failed_incomplete_torrent(setup, tmp_path):
+    factory, wire, _ = setup
+    client = PluginClientAdapter("prowlarr-qbittorrent", factory())
+    task_id = "b" * 32
+    handle = await client.enqueue(
+        p.EnqueueRequest(
+            task_id=task_id,
+            source=p.SOURCE,
+            job_name=f"droppedneedle-{task_id}-0",
+            payload=json.dumps({"magnet_url": "magnet:?xt=urn:btih:abc"}),
+        )
+    )
+    attempt = await _journal(tmp_path, client, handle, task_id)
+    assert attempt.state == "complete"
+    assert wire.deletes == [{"hashes": ["abc"], "deleteFiles": ["true"]}]
+
+
+async def test_qbittorrent_outage_does_not_fail_polling(setup, monkeypatch):
+    factory, wire, _ = setup
+    monkeypatch.setattr(p.asyncio, "sleep", _no_sleep)
+    instance = factory()
+    handle = await instance.enqueue(
+        p.EnqueueRequest(
+            task_id="test",
+            source=p.SOURCE,
+            payload=json.dumps({"magnet_url": "magnet:?xt=urn:btih:abc"}),
+        )
+    )
+    before = await instance.get_status(handle)
+    assert before.has_active_transfer
+    wire.qbt_down = True
+    during = await instance.get_status(handle)
+    assert during.status == "downloading"
+    assert during.bytes_downloaded == before.bytes_downloaded
+    assert not during.has_active_transfer
+    assert during.matched_transfers == 1
+    wire.qbt_down = False
+    assert (await instance.get_status(handle)).has_active_transfer
+
+
+async def test_rejected_api_key_still_fails_polling(setup):
+    factory, _, _ = setup
+    instance = factory()
+    instance._validate()
+    instance._client._request = _auth_rejected
+    with pytest.raises(p.QbittorrentApiError):
+        await instance.get_status(p.TaskHandle(source=p.SOURCE, job_name="droppedneedle-x"))
+
+
+async def _no_sleep(_):
+    return None
+
+
+async def _auth_rejected(*args, **kwargs):
+    raise p.QbittorrentApiError("qBittorrent rejected the API key", auth=True)
+
+
+async def test_prowlarr_proxied_magnet_becomes_download_url(setup):
+    factory, wire, _ = setup
+    proxied = "http://prowlarr/1/download?apikey=secret&link=abc&file=Album"
+    wire.search_rows[0].update(downloadUrl="", magnetUrl=proxied)
+    instance = factory()
+    results = await instance.search_album("Artist", "Album")
+    payload = json.loads(results[0].plugin.payload)
+    assert payload["download_url"] == proxied
+    assert payload["magnet_url"] == ""
+    await instance.enqueue(
+        p.EnqueueRequest(task_id="test", source=p.SOURCE, payload=results[0].plugin.payload)
+    )
+    assert wire.adds == 1
+
+
+async def test_staged_files_survive_torrent_removal(setup):
+    factory, wire, settings = setup
+    instance = factory()
+    handle = await instance.enqueue(
+        p.EnqueueRequest(
+            task_id="test",
+            source=p.SOURCE,
+            payload=json.dumps({"magnet_url": "magnet:?xt=urn:btih:abc"}),
+        )
+    )
+    album = Path(settings["downloads_path"]) / "Album"
+    album.mkdir()
+    (album / "01.flac").write_bytes(b"bytes")
+    wire.rows[0].update(progress=1.0, state="uploading")
+    assert len(await instance.list_completed_files(handle)) == 1
+    wire.rows.clear()  # e.g. a qBittorrent share-ratio limit removed it
+    staged = await instance.list_completed_files(handle)
+    assert [path.read_bytes() for path in staged] == [b"bytes"]
