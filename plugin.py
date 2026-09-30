@@ -2,6 +2,7 @@
 """DroppedNeedle v1 torrent source. Adapted from the fork at 51d8565d (NOTICE)."""
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -28,6 +29,9 @@ from infrastructure.plugins.protocols import (
 from models.common import ServiceStatus
 
 SOURCE = "plugin:prowlarr-qbittorrent"
+# Indexer API keys embedded in grab links are replaced by this marker in the stored
+# payload (search candidates are returned to browsers) and restored at enqueue.
+_KEY_PLACEHOLDER = "DROPPEDNEEDLE_INDEXER_KEY"
 
 
 class QbtTorrentInfo(msgspec.Struct, kw_only=True):
@@ -915,7 +919,9 @@ class TorrentPlugin(QbittorrentDownloadClient):
         self._validate()
         async with asyncio.timeout(timeout):
             query = f"{artist} {title}".strip()
-            if self.ctx.settings.get("search_backend", "prowlarr") == "torznab":
+            backend = self.ctx.settings.get("search_backend", "prowlarr")
+            secret = _secret(self.ctx.settings.get(f"{backend}_api_key", ""))
+            if backend == "torznab":
                 rows = await self._torznab(query, timeout)
             else:
                 client = self._prowlarr()
@@ -945,6 +951,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
                 download, magnet = download or magnet, ""
             if not download and not magnet:
                 continue
+            download = download.replace(secret, _KEY_PLACEHOLDER) if secret else download
             payload = json.dumps(
                 {
                     "download_url": download,
@@ -1062,8 +1069,23 @@ class TorrentPlugin(QbittorrentDownloadClient):
         tag = request.job_name or f"droppedneedle-{request.task_id}"
         if not re.fullmatch(r"droppedneedle-[A-Za-z0-9_-]+", tag):
             raise ValueError("Invalid task correlation tag")
+        download = payload.get("download_url", "")
+        if _KEY_PLACEHOLDER in download:
+            payload["download_url"] = download.replace(
+                _KEY_PLACEHOLDER, self._indexer_key(download)
+            )
+            request = msgspec.structs.replace(request, payload=json.dumps(payload))
         async with self._locks.setdefault("enqueue:" + tag, asyncio.Lock()):
             return await super().enqueue(request)
+
+    def _indexer_key(self, url):
+        """The configured key for the indexer that issued ``url``; never another host."""
+        for backend in ("prowlarr", "torznab"):
+            base = self.ctx.settings.get(f"{backend}_url", "").strip()
+            key = self.ctx.settings.get(f"{backend}_api_key", "").strip()
+            if base and key and _origin(base) == _origin(url):
+                return _secret(key)
+        raise ValueError("Grab link does not belong to a configured indexer")
 
     async def get_status(self, handle):
         self._validate()
@@ -1154,7 +1176,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
             fd, tmp = tempfile.mkstemp(prefix=".copy-", dir=target.parent)
             try:
                 with os.fdopen(fd, "wb") as output, resolved.open("rb") as source_file:
-                    shutil.copyfileobj(source_file, output)
+                    _copy_file(source_file, output)
                     output.flush()
                     os.fsync(output.fileno())
                 os.replace(tmp, target)
@@ -1212,6 +1234,26 @@ def _http_url(value):
         or parsed.password
     ):
         raise ValueError("Expected an HTTP(S) service URL without embedded credentials")
+
+
+def _origin(url):
+    parsed = urlsplit(url)
+    default = {"http": 80, "https": 443}.get(parsed.scheme)
+    return parsed.scheme, (parsed.hostname or "").lower(), parsed.port or default
+
+
+def _copy_file(source, output):
+    """Kernel-side copy (a reflink on btrfs/XFS), else a userspace copy."""
+    copied = 0
+    try:
+        while chunk := os.copy_file_range(source.fileno(), output.fileno(), 1 << 30):
+            copied += chunk
+        return
+    except (AttributeError, OSError) as exc:
+        unsupported = {errno.EXDEV, errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.EPERM}
+        if copied or (isinstance(exc, OSError) and exc.errno not in unsupported):
+            raise
+    shutil.copyfileobj(source, output)
 
 
 def _number(value, default=None):

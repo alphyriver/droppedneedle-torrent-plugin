@@ -17,6 +17,7 @@ class Wire:
     def __init__(self):
         self.rows = []
         self.adds = 0
+        self.added_urls = []
         self.deletes = []
         self.search_rows = [
             {
@@ -48,6 +49,7 @@ class Wire:
             if req.url.path.endswith("/torrents/add"):
                 self.adds += 1
                 data = parse_qs(req.content.decode())
+                self.added_urls.append(data["urls"][0])
                 self.rows.append(
                     {
                         "hash": "abc",
@@ -365,17 +367,17 @@ async def test_failed_copy_is_not_published_and_can_retry(setup, monkeypatch):
     source.write_bytes(b"unchanged")
     handle = p.TaskHandle(source=p.SOURCE, job_name="droppedneedle-test")
     job = instance._job_dir(handle)
-    original = p.shutil.copyfileobj
+    original = p._copy_file
 
     def broken(*args):
         raise OSError("disk full")
 
-    monkeypatch.setattr(p.shutil, "copyfileobj", broken)
+    monkeypatch.setattr(p, "_copy_file", broken)
     with pytest.raises(OSError):
         instance._stage_files(job, [source])
     assert not (job / ".ready.json").exists()
     assert source.read_bytes() == b"unchanged"
-    monkeypatch.setattr(p.shutil, "copyfileobj", original)
+    monkeypatch.setattr(p, "_copy_file", original)
     assert len(instance._stage_files(job, [source])) == 1
 
 
@@ -605,3 +607,31 @@ async def test_staged_files_survive_torrent_removal(setup):
     wire.rows.clear()  # e.g. a qBittorrent share-ratio limit removed it
     staged = await instance.list_completed_files(handle)
     assert [path.read_bytes() for path in staged] == [b"bytes"]
+
+
+async def test_indexer_key_never_stored_in_payload(setup):
+    factory, wire, _ = setup
+    wire.search_rows[0].update(downloadUrl="/1/download?apikey=prowlarr-key&link=abc")
+    instance = factory()
+    results = await instance.search_album("Artist", "Album")
+    assert "prowlarr-key" not in results[0].plugin.payload
+    await instance.enqueue(
+        p.EnqueueRequest(task_id="test", source=p.SOURCE, payload=results[0].plugin.payload)
+    )
+    assert wire.added_urls == ["http://prowlarr/1/download?apikey=prowlarr-key&link=abc"]
+
+
+async def test_indexer_key_not_sent_to_foreign_host(setup):
+    factory, wire, _ = setup
+    payload = json.dumps({"download_url": f"http://evil/grab?apikey={p._KEY_PLACEHOLDER}"})
+    with pytest.raises(ValueError):
+        await factory().enqueue(p.EnqueueRequest(task_id="test", source=p.SOURCE, payload=payload))
+    assert wire.adds == 0
+
+
+def test_copy_file_preserves_bytes(tmp_path):
+    source, target = tmp_path / "a.flac", tmp_path / "b.flac"
+    source.write_bytes(b"x" * 300_000)
+    with source.open("rb") as src, target.open("wb") as dst:
+        p._copy_file(src, dst)
+    assert target.read_bytes() == source.read_bytes()
