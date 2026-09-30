@@ -40,17 +40,17 @@ def prepare(config: Path, output: Path, staging: str):
         raise ValueError("Existing qBittorrent and Prowlarr URLs are required")
     if not qbt.get("downloads_mount") or not Path(staging).is_absolute():
         raise ValueError("Existing download mount and absolute staging path are required")
-    settings = dict(
-        qbittorrent_url=qbt["url"],
-        qbittorrent_api_key=encrypted(qbt.get("api_key", "")),
-        prowlarr_url=prowlarr["url"],
-        prowlarr_api_key=encrypted(prowlarr.get("api_key", "")),
-        downloads_path=qbt["downloads_mount"],
-        staging_path=staging,
-        category=qbt.get("category") or "droppedneedle",
-        search_backend="prowlarr",
-        categories=",".join(str(c) for c in prowlarr.get("categories", [3000])) or "3000",
-    )
+    settings = {
+        "qbittorrent_url": qbt["url"],
+        "qbittorrent_api_key": encrypted(qbt.get("api_key", "")),
+        "prowlarr_url": prowlarr["url"],
+        "prowlarr_api_key": encrypted(prowlarr.get("api_key", "")),
+        "downloads_path": qbt["downloads_mount"],
+        "staging_path": staging,
+        "category": qbt.get("category") or "droppedneedle",
+        "search_backend": "prowlarr",
+        "categories": ",".join(str(c) for c in prowlarr.get("categories", [3000])) or "3000",
+    }
     data.setdefault("plugins", {})[NAME] = {"enabled": False, "settings": settings}
     # Do not change active sources until the operator enables/selects the plugin.
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

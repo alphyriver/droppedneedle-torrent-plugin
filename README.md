@@ -2,14 +2,14 @@
 
 Prowlarr or Torznab search and qBittorrent downloads for **unmodified DroppedNeedle** using Plugin API v1. This extracts the torrent integration from [alphyriver/DroppedNeedle](https://github.com/alphyriver/DroppedNeedle), so maintaining an application fork is no longer required for torrent acquisition.
 
-Status: 25 tests pass locally against upstream **v2.15.0** (`1cf117b4e0f3899d1daa786d316fd9ee8bcea1ab`) and main `cf7278a1`. Real-service deployment acceptance is still required. No production migration has been performed.
+Status: 34 tests pass against upstream **v2.15.0** (`1cf117b4e0f3899d1daa786d316fd9ee8bcea1ab`) and main `cf7278a1`. Real-service deployment acceptance is still required. No production migration has been performed.
 
 ## Requirements
 
 - DroppedNeedle v2.15.0 (tested); Plugin API v1 was introduced in v2.13.0.
 - qBittorrent 5.2+ with a Web API bearer key, matching the original fork's authentication support. Username/password login is not implemented.
 - Your Prowlarr instance, or one direct Torznab feed. Multiple direct feeds can be aggregated through Prowlarr.
-- A persistent `/app/plugins` volume, a readable torrent downloads mount, and a **separate dedicated writable staging directory**. Allow space for an extra copy of each importing release.
+- A persistent `/app/plugins` volume, a readable torrent downloads mount, and a **separate dedicated writable staging directory**. Allow space for an extra copy of each importing release (copies use `copy_file_range`, so on btrfs/XFS with staging on the same filesystem they are reflinks that share blocks).
 
 ## Install
 
@@ -33,12 +33,14 @@ Select **Torrents** in source priority. Upstream's built-in Prowlarr panel remai
 
 ## Behavior
 
-- Filters Prowlarr results to torrents; excludes zero-seeder releases and audio-video category 3020. Deduplicates by reported info hash, otherwise magnet or download URL.
+- Filters Prowlarr results to torrents; excludes zero-seeder releases and audio-video category 3020. Deduplicates by reported info hash, otherwise magnet or download URL. Proxied magnet links (Prowlarr/Jackett return `magnetUrl` as an HTTP redirect) are submitted as download URLs.
 - Uses the host's artist/album matching and quality policy. Lossless, MP3 320/256/192 declarations become host quality tiers. Missing seeder counts cap confidence at 0.69, below the host's default 0.70 automatic threshold; lowering the host threshold can permit them automatically.
 - Transfers whole releases, including for single-track requests; the host selects/imports the requested tracks.
 - Correlates work by persistent qBittorrent task tags and category, including after a process restart or an ambiguous add response. Never automatically adopts or deletes an unrelated torrent already present in qBittorrent.
-- Completed torrents keep seeding. Import receives **copies**, not hardlinks: moving or retagging those copies cannot alter the torrent payload. Interrupted staging is retryable; completed staging manifests survive restart and consumed files are not recopied.
-- Cancel/discard deletes **incomplete, task-tagged torrents** and their partial data. Completed torrents are retained. Host cleanup sees staging paths only.
+- Completed torrents keep seeding. Import receives **copies**, not hardlinks: moving or retagging those copies cannot alter the torrent payload. Interrupted staging is retryable; completed staging manifests survive restart, and later removal of the torrent, and consumed files are not recopied.
+- Cancel/discard deletes **incomplete, task-tagged torrents** and their partial data. Completed torrents are retained. Materialization evidence reports no file paths (the host journal only unlinks fingerprinted Soulseek paths); discarding an attempt removes its staging directory.
+- A qBittorrent outage while polling (transport error or 5xx) reports the last known progress with no active transfer, instead of failing the task. The host's queued timeout remains the backstop. A rejected API key still fails immediately.
+- Indexer API keys embedded in grab links are replaced with a placeholder in the stored search payload (candidates are returned to browsers) and restored at enqueue only for the configured Prowlarr/Torznab origin.
 - Uses the host's shared HTTP client. It has no additional runtime package requirements beyond DroppedNeedle.
 
 Keep the category save path and plugin paths stable while tasks are active. A pre-existing untagged torrent with the same hash is not adopted automatically; complete its import manually or resolve it in qBittorrent before retrying. A missing/removed torrent remains subject to the host's no-show timeout.
@@ -57,6 +59,6 @@ python -m ruff format --check .
 
 Tests load the real upstream manifest, host, and adapters, with mock HTTP services and real temporary filesystem copies. They cover restart recovery, concurrent enqueue, ambiguous add failures, search filtering, Torznab XML bounds, path confinement, staging failure, and seeding preservation. They do not substitute for a real download and library import.
 
-The prepared GitHub Actions workflow is in `ci/github-actions-test.yml`. The publishing credential lacks the `workflow` scope, so it is a template rather than an active workflow. A repository administrator can review and place it at `.github/workflows/test.yml`.
+CI (`.github/workflows/test.yml`) runs the tests and ruff against the pinned upstream v2.15.0 checkout on every pull request and push to `main`.
 
 AGPL-3.0-only; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -2,6 +2,7 @@
 """DroppedNeedle v1 torrent source. Adapted from the fork at 51d8565d (NOTICE)."""
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
@@ -28,6 +29,9 @@ from infrastructure.plugins.protocols import (
 from models.common import ServiceStatus
 
 SOURCE = "plugin:prowlarr-qbittorrent"
+# Indexer API keys embedded in grab links are replaced by this marker in the stored
+# payload (search candidates are returned to browsers) and restored at enqueue.
+_KEY_PLACEHOLDER = "DROPPEDNEEDLE_INDEXER_KEY"
 
 
 class QbtTorrentInfo(msgspec.Struct, kw_only=True):
@@ -266,9 +270,6 @@ class QbittorrentClient:
         return resp.status_code < 400
 
 
-logger = logging.getLogger(__name__)
-
-
 class ProwlarrApiError(ExternalServiceError):
     """Transport/HTTP/Prowlarr error. Mapped to HTTP 503 by the registered handler."""
 
@@ -370,8 +371,6 @@ class ProwlarrClient:
         except ValueError as exc:
             raise ProwlarrApiError("Prowlarr returned non-JSON") from exc
 
-
-logger = logging.getLogger(__name__)
 
 # Mirror of library_manager._AUDIO_SUFFIXES (kept local for layering, like SABnzbd's).
 _AUDIO_SUFFIXES = {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus", ".wav"}
@@ -739,8 +738,6 @@ def _path_has_file(path: Path) -> bool:
 
 def _supports_api_key(version: str) -> bool:
     """qBittorrent added Bearer API-key authentication in 5.2.0."""
-    import re
-
     match = re.search(r"(\d+)\.(\d+)", version or "")
     return bool(match and (int(match.group(1)), int(match.group(2))) >= (5, 2))
 
@@ -809,6 +806,9 @@ class TorrentPlugin(QbittorrentDownloadClient):
     def __init__(self, context):
         self.ctx = context
         self._locks = {}
+        self._validated = None
+        # Last good status per job, replayed while qBittorrent is briefly unreachable.
+        self._last_status = {}
         self._refresh()
 
     def _refresh(self):
@@ -826,8 +826,12 @@ class TorrentPlugin(QbittorrentDownloadClient):
         self._stage = Path(settings.get("staging_path", "") or ".")
 
     def _validate(self):
+        settings = dict(self.ctx.settings)
+        snapshot = tuple(sorted(settings.items()))
+        # Polls call this for every task; only re-check paths when settings change.
+        if snapshot == self._validated:
+            return
         self._refresh()
-        settings = self.ctx.settings
         for key in ("qbittorrent_url", "qbittorrent_api_key", "downloads_path", "staging_path"):
             if not settings.get(key, "").strip():
                 raise ValueError(f"Configure {key}")
@@ -845,6 +849,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
                 raise ValueError(f"Configure {backend}_{suffix}")
         _http_url(settings[f"{backend}_url"])
         self._categories()
+        self._validated = snapshot
 
     def _categories(self):
         raw = self.ctx.settings.get("categories", "").strip() or "3000"
@@ -914,21 +919,25 @@ class TorrentPlugin(QbittorrentDownloadClient):
         self._validate()
         async with asyncio.timeout(timeout):
             query = f"{artist} {title}".strip()
-            if self.ctx.settings.get("search_backend", "prowlarr") == "torznab":
+            backend = self.ctx.settings.get("search_backend", "prowlarr")
+            secret = _secret(self.ctx.settings.get(f"{backend}_api_key", ""))
+            if backend == "torznab":
                 rows = await self._torznab(query, timeout)
             else:
                 client = self._prowlarr()
                 hits = await client.search(query, self._categories(), timeout=timeout)
                 rows = [
-                    dict(
-                        title=r.title,
-                        size=r.size,
-                        seeders=r.seeders,
-                        download_url=client.absolute_url(r.download_url) if r.download_url else "",
-                        magnet_url=r.magnet_url,
-                        info_hash=r.info_hash,
-                        categories=[c.id for c in r.categories],
-                    )
+                    {
+                        "title": r.title,
+                        "size": r.size,
+                        "seeders": r.seeders,
+                        "download_url": client.absolute_url(r.download_url)
+                        if r.download_url
+                        else "",
+                        "magnet_url": r.magnet_url,
+                        "info_hash": r.info_hash,
+                        "categories": [c.id for c in r.categories],
+                    }
                     for r in hits
                     if r.protocol.lower() == "torrent"
                 ]
@@ -937,14 +946,22 @@ class TorrentPlugin(QbittorrentDownloadClient):
             if row["seeders"] == 0 or 3020 in row.get("categories", []):
                 continue
             download, magnet = row.get("download_url", ""), row.get("magnet_url", "")
+            if magnet and not magnet.startswith("magnet:"):
+                # Prowlarr (and Jackett) proxy magnets as HTTP links that redirect.
+                download, magnet = download or magnet, ""
             if not download and not magnet:
                 continue
+            download = download.replace(secret, _KEY_PLACEHOLDER) if secret else download
             payload = json.dumps(
-                dict(download_url=download, magnet_url=magnet, info_hash=row.get("info_hash", "")),
+                {
+                    "download_url": download,
+                    "magnet_url": magnet,
+                    "info_hash": row.get("info_hash", ""),
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            identity = row.get("info_hash") or magnet or download
+            identity = row.get("info_hash", "").lower() or magnet or download
             if identity in seen:
                 continue
             seen.add(identity)
@@ -991,7 +1008,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
                     raise ValueError("Torznab response exceeds 8 MiB")
         # Reject non-UTF-8 XML (including UTF-16 entity-declaration bypasses).
         xml = bytes(raw).decode("utf-8-sig")
-        if "\x00" in xml or re.search(r"<!\s*(DOCTYPE|ENTITY)", xml, re.I):
+        if "\x00" in xml or re.search(r"<!\s*(DOCTYPE|ENTITY)", xml, re.IGNORECASE):
             raise ValueError("Torznab XML contains a forbidden declaration")
         root = ET.fromstring(xml)
         if root.tag.rsplit("}", 1)[-1] == "error":
@@ -1007,14 +1024,8 @@ class TorrentPlugin(QbittorrentDownloadClient):
                         child.get("value", "")
                     )
 
-            def first(name, default=""):
+            def first(name, default="", attrs=attrs):
                 return attrs.get(name, [default])[0]
-
-            def number(value, default=None):
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return default
 
             enclosure = item.find("enclosure")
             link = (
@@ -1024,20 +1035,20 @@ class TorrentPlugin(QbittorrentDownloadClient):
             )
             magnet = first("magneturl") or (link if link.startswith("magnet:") else "")
             rows.append(
-                dict(
-                    title=(item.findtext("title") or "").strip(),
-                    size=number(
+                {
+                    "title": (item.findtext("title") or "").strip(),
+                    "size": _number(
                         first("size") or (enclosure.get("length") if enclosure is not None else ""),
                         0,
                     ),
-                    seeders=number(first("seeders")),
-                    magnet_url=magnet,
-                    download_url=urljoin(url, link)
+                    "seeders": _number(first("seeders")),
+                    "magnet_url": magnet,
+                    "download_url": urljoin(url, link)
                     if link and not link.startswith("magnet:")
                     else "",
-                    info_hash=first("infohash"),
-                    categories=[number(c, 0) for c in attrs.get("category", [])],
-                )
+                    "info_hash": first("infohash"),
+                    "categories": [_number(c, 0) for c in attrs.get("category", [])],
+                }
             )
         return rows
 
@@ -1045,7 +1056,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
         self._validate()
         payload = json.loads(request.payload)
         if not isinstance(payload, dict):
-            raise ValueError("Invalid torrent payload")
+            raise TypeError("Invalid torrent payload")
         for key in ("download_url", "magnet_url"):
             value = payload.get(key, "")
             if not isinstance(value, str) or any(c in value for c in "\r\n"):
@@ -1058,12 +1069,47 @@ class TorrentPlugin(QbittorrentDownloadClient):
         tag = request.job_name or f"droppedneedle-{request.task_id}"
         if not re.fullmatch(r"droppedneedle-[A-Za-z0-9_-]+", tag):
             raise ValueError("Invalid task correlation tag")
+        download = payload.get("download_url", "")
+        if _KEY_PLACEHOLDER in download:
+            payload["download_url"] = download.replace(
+                _KEY_PLACEHOLDER, self._indexer_key(download)
+            )
+            request = msgspec.structs.replace(request, payload=json.dumps(payload))
         async with self._locks.setdefault("enqueue:" + tag, asyncio.Lock()):
             return await super().enqueue(request)
 
+    def _indexer_key(self, url):
+        """The configured key for the indexer that issued ``url``; never another host."""
+        for backend in ("prowlarr", "torznab"):
+            base = self.ctx.settings.get(f"{backend}_url", "").strip()
+            key = self.ctx.settings.get(f"{backend}_api_key", "").strip()
+            if base and key and _origin(base) == _origin(url):
+                return _secret(key)
+        raise ValueError("Grab link does not belong to a configured indexer")
+
     async def get_status(self, handle):
         self._validate()
-        return await super().get_status(handle)
+        try:
+            status = await super().get_status(handle)
+        except QbittorrentApiError as exc:
+            # The host only pauses for slskd outages; a raise here fails the task and
+            # the cleanup journal then deletes the partial torrent. Report no active
+            # transfer instead, so the host's queued timeout stays the backstop.
+            if exc.auth:
+                raise
+            logger.warning("qbittorrent unavailable while polling %s: %s", handle.job_name, exc)
+            last = self._last_status.get(handle.job_name)
+            if last is None:
+                return DownloadTaskStatus(task_id="", status="queued", matched_transfers=1)
+            return msgspec.structs.replace(last, has_active_transfer=False)
+        if status.status in ("queued", "downloading", "processing") and status.matched_transfers:
+            self._last_status.pop(handle.job_name, None)
+            self._last_status[handle.job_name] = status
+            while len(self._last_status) > 2000:
+                self._last_status.pop(next(iter(self._last_status)))
+        else:
+            self._last_status.pop(handle.job_name, None)
+        return status
 
     async def abort(self, handle):
         self._validate()
@@ -1085,6 +1131,10 @@ class TorrentPlugin(QbittorrentDownloadClient):
         job = self._job_dir(handle)
         lock = self._locks.setdefault(str(job), asyncio.Lock())
         async with lock:
+            # Completed staging survives the torrent being removed or rechecked later.
+            staged = await asyncio.to_thread(self._read_manifest, job)
+            if staged is not None:
+                return staged
             sources = await super().list_completed_files(handle)
             if not sources:
                 return []
@@ -1096,17 +1146,21 @@ class TorrentPlugin(QbittorrentDownloadClient):
                 await task
                 raise
 
+    @staticmethod
+    def _read_manifest(job):
+        marker = job / ".ready.json"
+        if not marker.exists():
+            return None
+        candidates = [job / name for name in json.loads(marker.read_text())]
+        if any(not p.resolve().is_relative_to(job.resolve()) or p.is_symlink() for p in candidates):
+            raise ValueError("Invalid staging manifest path")
+        return [p for p in candidates if p.is_file()]
+
     def _stage_files(self, job, sources):
         job.mkdir(parents=True, exist_ok=True)
-        marker = job / ".ready.json"
-        if marker.exists():
-            names = json.loads(marker.read_text())
-            candidates = [job / name for name in names]
-            if any(
-                not p.resolve().is_relative_to(job.resolve()) or p.is_symlink() for p in candidates
-            ):
-                raise ValueError("Invalid staging manifest path")
-            return [p for p in candidates if p.is_file()]
+        staged = self._read_manifest(job)
+        if staged is not None:
+            return staged
         mount = self._mount.resolve()
         names = []
         for source in sources:
@@ -1122,7 +1176,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
             fd, tmp = tempfile.mkstemp(prefix=".copy-", dir=target.parent)
             try:
                 with os.fdopen(fd, "wb") as output, resolved.open("rb") as source_file:
-                    shutil.copyfileobj(source_file, output)
+                    _copy_file(source_file, output)
                     output.flush()
                     os.fsync(output.fileno())
                 os.replace(tmp, target)
@@ -1134,7 +1188,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
             json.dump(names, output)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(tmp_marker, marker)
+        os.replace(tmp_marker, job / ".ready.json")
         return [job / name for name in names]
 
     async def get_file_path(self, handle, remote_filename, size=None):
@@ -1146,19 +1200,14 @@ class TorrentPlugin(QbittorrentDownloadClient):
         self._validate()
         evidence = await super().inspect_materialization(handle)
         job = self._job_dir(handle)
-        # Host cleanup may unlink ONLY the separate staging copies, never torrent bytes.
-        paths = await asyncio.to_thread(
-            lambda: [
-                str(p)
-                for p in job.rglob("*")
-                if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(job.resolve())
-            ]
-        )
+        # No file_paths: the v2.15 cleanup journal only unlinks fingerprinted
+        # soulseek paths and parks any other source's paths in needs_attention.
+        # Torrent bytes are never reported; discard_client_artifacts removes
+        # the staging job directory itself.
         return DownloadMaterialization(
             state=evidence.state,
             mount_root=str(self._stage.resolve()),
             workspace_path=str(job),
-            file_paths=paths,
             mount_healthy=evidence.mount_healthy,
         )
 
@@ -1187,8 +1236,35 @@ def _http_url(value):
         raise ValueError("Expected an HTTP(S) service URL without embedded credentials")
 
 
+def _origin(url):
+    parsed = urlsplit(url)
+    default = {"http": 80, "https": 443}.get(parsed.scheme)
+    return parsed.scheme, (parsed.hostname or "").lower(), parsed.port or default
+
+
+def _copy_file(source, output):
+    """Kernel-side copy (a reflink on btrfs/XFS), else a userspace copy."""
+    copied = 0
+    try:
+        while chunk := os.copy_file_range(source.fileno(), output.fileno(), 1 << 30):
+            copied += chunk
+        return
+    except (AttributeError, OSError) as exc:
+        unsupported = {errno.EXDEV, errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.EPERM}
+        if copied or (isinstance(exc, OSError) and exc.errno not in unsupported):
+            raise
+    shutil.copyfileobj(source, output)
+
+
+def _number(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _quality(title, categories):
-    if re.search(r"\b(flac|alac|lossless)\b", title, re.I) or 3040 in categories:
+    if re.search(r"\b(flac|alac|lossless)\b", title, re.IGNORECASE) or 3040 in categories:
         return "lossless"
     if 3020 in categories:
         return ""
