@@ -27,7 +27,18 @@ Retain:
 - `/mnt/media/torrents/droppedneedle:/qbittorrent-downloads:ro`
 - Existing music, slskd, and Usenet mounts.
 
-In **Settings > Plugins > Torrents**, enter existing connection values using the secret fields. Use:
+Prepare a separate configuration candidate using the existing `config.json` and adjacent `.env` encryption key:
+
+```sh
+python prepare_migration.py --config /path/to/copied-config/config.json \
+  --output /path/to/copied-config/config.candidate.json --staging /plugin-staging
+```
+
+The helper never overwrites its input, writes the candidate mode 0600, and keeps the plugin disabled and source priority unchanged. It preserves existing encrypted API keys, encrypts legacy plaintext keys for the plugin, and does not print credentials. Run it against the stopped-volume backup immediately before cutover, so unrelated settings are not overwritten by an older candidate. Preserve the same `.env` key alongside the candidate. Review and promote the candidate to `config.json` only while the service is stopped.
+
+Upstream v2.15.0 masks plugin secrets but saves their supplied values without encryption. The plugin accepts the fork's ciphertext directly and decrypts it with the host key. Do not replace migrated keys with plaintext via the plugin settings UI unless upstream has fixed that save path.
+
+In **Settings > Plugins > Torrents**, check the migrated connection settings. Use:
 
 | Plugin setting | Value |
 | --- | --- |
@@ -42,7 +53,7 @@ Enable the plugin and add **Torrents** to source priority. If Usenet is also use
 
 ### Existing tasks are not converted
 
-The fork uses `source="torrent"` and additional torrent-specific handle fields. Upstream uses `source="plugin:prowlarr-qbittorrent"` and durable job-name correlation. This plugin does **not** rewrite historical database rows, active attempts, quarantine records, source priorities, or encrypted settings. Completed library entries remain in the normal upstream library; old torrent task history is not guaranteed to remain actionable. Keep the stopped-volume backup and drain active work before switching. Recreate any wanted requests that still reference the retired source through the normal UI.
+The fork uses `source="torrent"` and additional torrent-specific handle fields. Upstream uses `source="plugin:prowlarr-qbittorrent"` and durable job-name correlation. This plugin does **not** rewrite historical database rows, active attempts, quarantine records, or source priorities. The optional helper copies connection settings into a separate disabled plugin configuration while preserving encrypted credentials. Completed library entries remain in the normal upstream library; old torrent task history is not guaranteed to remain actionable. Keep the stopped-volume backup and drain active work before switching. Recreate any wanted requests that still reference the retired source through the normal UI.
 
 ## Acceptance before retiring the fork
 

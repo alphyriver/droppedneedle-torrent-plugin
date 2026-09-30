@@ -814,7 +814,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
     def _refresh(self):
         settings = self.ctx.settings
         url = settings.get("qbittorrent_url", "").strip().rstrip("/")
-        key = settings.get("qbittorrent_api_key", "").strip()
+        key = _secret(settings.get("qbittorrent_api_key", ""))
         QbittorrentDownloadClient.__init__(
             self,
             QbittorrentClient(self.ctx.http, url, key),
@@ -897,7 +897,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
         return ProwlarrClient(
             self.ctx.http,
             self.ctx.settings["prowlarr_url"].strip(),
-            self.ctx.settings["prowlarr_api_key"].strip(),
+            _secret(self.ctx.settings["prowlarr_api_key"]),
         )
 
     async def search_album(
@@ -973,7 +973,7 @@ class TorrentPlugin(QbittorrentDownloadClient):
         url = settings["torznab_url"].strip().rstrip("/")
         if not url.endswith("/api"):
             url += "/api"
-        params = {"apikey": settings["torznab_api_key"], "t": "caps" if caps else "search"}
+        params = {"apikey": _secret(settings["torznab_api_key"]), "t": "caps" if caps else "search"}
         if not caps:
             params.update(
                 q=query, cat=",".join(map(str, self._categories())), extended="1", limit="100"
@@ -1196,3 +1196,20 @@ def _quality(title, categories):
         if re.search(rf"\b{bitrate}\b", title):
             return f"mp3_{bitrate}"
     return ""
+
+
+def _secret(value):
+    """Accept the fork's Fernet ciphertext without writing plaintext settings.
+
+    v2.15.0 masks secret fields but does not decrypt/encrypt plugin settings.
+    The host initializes its crypto key before loading plugins.
+    """
+    value = value.strip()
+    if value.startswith("gAAAA"):
+        from infrastructure.crypto import decrypt
+
+        plaintext, legacy = decrypt(value)
+        if legacy:
+            raise ValueError("Plugin credential cannot be decrypted with this installation key")
+        return plaintext.strip()
+    return value

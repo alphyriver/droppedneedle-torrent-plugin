@@ -22,5 +22,5 @@ jobs:
       - run: python -m pytest -q
         env:
           DROPPEDNEEDLE_SOURCE: ${{ github.workspace }}/upstream
-      - run: python -m ruff check plugin.py tests
-      - run: python -m ruff format --check plugin.py tests
+      - run: python -m ruff check plugin.py prepare_migration.py tests
+      - run: python -m ruff format --check plugin.py prepare_migration.py tests

@@ -2,7 +2,7 @@
 
 Prowlarr or Torznab search and qBittorrent downloads for **unmodified DroppedNeedle** using Plugin API v1. This extracts the torrent integration from [alphyriver/DroppedNeedle](https://github.com/alphyriver/DroppedNeedle), so maintaining an application fork is no longer required for torrent acquisition.
 
-Status: tested locally against upstream **v2.15.0** (`1cf117b4e0f3899d1daa786d316fd9ee8bcea1ab`) and main `cf7278a1`. Real-service deployment acceptance is still required. No production migration has been performed.
+Status: 25 tests pass locally against upstream **v2.15.0** (`1cf117b4e0f3899d1daa786d316fd9ee8bcea1ab`) and main `cf7278a1`. Real-service deployment acceptance is still required. No production migration has been performed.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ Status: tested locally against upstream **v2.15.0** (`1cf117b4e0f3899d1daa786d31
 
 Install from `https://github.com/alphyriver/droppedneedle-torrent-plugin` in **Settings > Plugins**, or copy this repository into `/app/plugins/prowlarr-qbittorrent`, keeping `plugin.toml` and `plugin.py` at that directory's root.
 
-Configure the fields below, then enable the plugin. Installation alone does not enable it. API-key fields use the host's encrypted secret settings.
+Configure the fields below, then enable the plugin. Installation alone does not enable it. API-key fields are masked by the host. For fork migration, use `prepare_migration.py` to retain encrypted credentials; the plugin decrypts them at runtime with the installation key. In upstream v2.15.0, newly typed plugin secrets are stored as supplied despite the API documentation claiming encryption. Avoid replacing migrated keys with plaintext through that UI.
 
 | Setting | Example / meaning |
 | --- | --- |
